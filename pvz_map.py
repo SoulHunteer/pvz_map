@@ -1,10 +1,3 @@
-import pip
-pip.main(['install', 'pytelegrambotapi'])
-pip.main(['install', 'selenium'])
-pip.main(['install', 'opencv-python'])
-pip.main(['install', 'numpy'])
-pip.main(['install', 'csv'])
-
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
@@ -12,12 +5,12 @@ import time
 import cv2
 import numpy as np
 import csv
-import sys
 import telebot
+import os
 
 
-TELEGRAM_BOT_TOKEN = sys.argv[1]
-TELEGRAM_CHAT_ID = sys.argv[2]
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 bot_token = TELEGRAM_BOT_TOKEN
 bot = telebot.TeleBot(token=bot_token)
