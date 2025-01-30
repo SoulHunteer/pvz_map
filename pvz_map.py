@@ -314,8 +314,15 @@ def init_driver():
         chrome_options = webdriver.ChromeOptions()
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument(f'--user-data-dir=/tmp/chrome_{time.time()}')  # Уникальная директория
+
+        # Добавьте дополнительные флаги
+        chrome_options.add_argument('--remote-allow-origins=*')
+        chrome_options.add_argument('--disable-infobars')
+        chrome_options.add_argument('--disable-extensions')
+
         driver = webdriver.Chrome(options=chrome_options)
         return driver
     except Exception as e:

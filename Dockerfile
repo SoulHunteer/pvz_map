@@ -13,12 +13,17 @@ RUN apt-get update && apt-get install -y \
     xvfb
 
 # Установка Chrome for Testing (новый официальный канал)
-RUN CHROME_VERSION="132.0.6834.159" && \
-    wget chrome.deb https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-linux64.zip && \
-    unzip chrome-linux64.zip -d /usr/local/bin/ && \
-    mv /usr/local/bin/chrome-linux64.zip/chrome /usr/local/bin/ && \
-    chmod +x /usr/local/bin/chrome && \
-    rm -rf chrome-linux64.zip.zip
+#RUN CHROME_VERSION="132.0.6834.159" && \
+#    wget -O chrome.deb https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${CHROME_VERSION}-1_amd64.deb && \
+#    apt-get install -y ./chrome.deb && \
+#    rm chrome.deb
+
+
+# install google-chrome
+RUN wget  https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+RUN dpkg -i google-chrome-stable_current_amd64.deb || true
+RUN apt update
+RUN apt -f install -y
 
 # Установка ChromeDriver для Chrome for Testing
 RUN CHROME_VERSION="132.0.6834.159" && \
