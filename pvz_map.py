@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-TELEGRAM_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+TELEGRAM_TOKEN = '7522223314:AAHJo_fVMNaIyxygrbKzGN_kae7pvTBm8Zk' #os.environ['TELEGRAM_BOT_TOKEN']
 bot = telebot.TeleBot(token=TELEGRAM_TOKEN)
 
 COLOR_LEGEND = (
@@ -310,23 +310,26 @@ def init_driver():
     WebDriver: Экземпляр Chrome WebDriver
     """
     logger.info("Инициализация Chrome драйвера")
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--headless=new')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-software-rasterizer')
+    chrome_options.add_argument('--disable-features=VizDisplayCompositor')
+    chrome_options.add_argument('--window-size=1920,1080')
+
     try:
-        chrome_options = webdriver.ChromeOptions()
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--headless=new')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument(f'--user-data-dir=/tmp/chrome_{time.time()}')  # Уникальная директория
-
-        # Добавьте дополнительные флаги
-        chrome_options.add_argument('--remote-allow-origins=*')
-        chrome_options.add_argument('--disable-infobars')
-        chrome_options.add_argument('--disable-extensions')
-
-        driver = webdriver.Chrome(options=chrome_options)
+        driver = webdriver.Chrome(
+            options=chrome_options,
+            service=webdriver.ChromeService(
+                executable_path='/usr/bin/chromedriver',
+                service_args=['--verbose']
+            )
+        )
         return driver
     except Exception as e:
-        logger.critical(f"Ошибка инициализации драйвера: {str(e)}")
+        logger.error(f"Ошибка инициализации драйвера: {str(e)}")
         raise
 
 
