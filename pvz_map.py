@@ -310,26 +310,20 @@ def init_driver():
     WebDriver: Экземпляр Chrome WebDriver
     """
     logger.info("Инициализация Chrome драйвера")
-    chrome_options = webdriver.ChromeOptions()
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--headless=new')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--disable-software-rasterizer')
-    chrome_options.add_argument('--disable-features=VizDisplayCompositor')
-    chrome_options.add_argument('--window-size=1920,1080')
-
     try:
-        driver = webdriver.Chrome(
-            options=chrome_options,
-            service=webdriver.ChromeService(
-                executable_path='/usr/bin/chromedriver',
-                service_args=['--verbose']
-            )
-        )
+        chrome_options = webdriver.ChromeOptions()
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument(f'--user-data-dir=/tmp/chrome_{time.time()}')  # Уникальная директория
+        chrome_options.add_argument('--disable-infobars')
+        chrome_options.add_argument('--disable-extensions')
+
+        driver = webdriver.Chrome(options=chrome_options)
         return driver
     except Exception as e:
-        logger.error(f"Ошибка инициализации драйвера: {str(e)}")
+        logger.critical(f"Ошибка инициализации драйвера: {str(e)}")
         raise
 
 
