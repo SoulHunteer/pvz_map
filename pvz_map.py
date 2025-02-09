@@ -10,6 +10,9 @@ import time
 import cv2
 import numpy as np
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -23,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-TELEGRAM_TOKEN = '7522223314:AAHJo_fVMNaIyxygrbKzGN_kae7pvTBm8Zk' #os.environ['TELEGRAM_BOT_TOKEN']
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 bot = telebot.TeleBot(token=TELEGRAM_TOKEN)
 
 COLOR_LEGEND = (
@@ -312,15 +315,10 @@ def init_driver():
     logger.info("Инициализация Chrome драйвера")
     try:
         chrome_options = webdriver.ChromeOptions()
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--headless')
         chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument(f'--user-data-dir=/tmp/chrome_{time.time()}')  # Уникальная директория
-        chrome_options.add_argument('--disable-infobars')
-        chrome_options.add_argument('--disable-extensions')
-
         driver = webdriver.Chrome(options=chrome_options)
+        logger.info("Драйвер успешно инициализирован")
         return driver
     except Exception as e:
         logger.critical(f"Ошибка инициализации драйвера: {str(e)}")
@@ -328,13 +326,14 @@ def init_driver():
 
 
 # Обработка карты
-def process_map(driver, map_link):
+def process_map(driver, map_link, user_id):
     """
     Обрабатывает карту по указанной ссылке
 
     Параметры:
     driver (WebDriver): Экземпляр Selenium WebDriver
     map_link (str): URL-адрес карты
+    user_id: User id
 
     Возвращает:
     tuple: (screenshot_path, zones, original_path)
@@ -346,12 +345,16 @@ def process_map(driver, map_link):
         driver.find_element(By.CLASS_NAME, 'ant-drawer-close').click()
         time.sleep(1)
         screenshot, _ = take_screenshot(driver)
-        original_path = 'original_screenshot.png'
+        # Сохраняем оригинал и обработанное изображение с привязкой к user_id
+        original_path = f'original_{user_id}.png'
+        processed_path = f'processed_{user_id}.png'
+
         cv2.imwrite(original_path, screenshot)
         zones = process_image(screenshot)
-        save_image_with_zones(screenshot, zones)
+        save_image_with_zones(screenshot, zones, processed_path)
+
         logger.info(f"Обнаружено зон: {len(zones)}")
-        return 'map_with_zones.png', zones, original_path
+        return processed_path, zones, original_path
     except Exception as e:
         logger.error(f"Ошибка обработки карты: {str(e)}")
         raise
@@ -413,7 +416,7 @@ def process_image(image):
 
 
 # Сохранение изображения с зонами
-def save_image_with_zones(image, zones):
+def save_image_with_zones(image, zones, path):
     """
     Сохраняет изображение с отмеченными зонами
 
@@ -428,7 +431,7 @@ def save_image_with_zones(image, zones):
     try:
         for zone in zones:
             cv2.circle(image, (zone['x'], zone['y']), zone['radius'], (0, 255, 0), 2)
-        cv2.imwrite('map_with_zones.png', image)
+        cv2.imwrite(path, image)
     except Exception as e:
         logger.error(f"Ошибка сохранения изображения: {str(e)}")
         raise
@@ -457,7 +460,7 @@ def background_check():
             driver = init_driver()
             try:
                 old_zones = get_user_zones(user_id)
-                screenshot_path, new_zones, original_path = process_map(driver, map_link)
+                screenshot_path, new_zones, original_path = process_map(driver, map_link, user_id)
                 added, removed = compare_zones(old_zones, new_zones)
 
                 if added or removed:
@@ -538,7 +541,7 @@ def send_welcome(message):
         "🌍 Система мониторинга зон\n\n"
         "📌 Отправьте ссылку на карту\n"
         "🆓 Пробный период: 3 дня\n"
-        "🔔 Изменения проверяются каждые 30 секунд"
+        "🔔 Изменения проверяются каждые 2 минуты"
     )
 
     markup = InlineKeyboardMarkup()
@@ -590,29 +593,118 @@ def check_expired_subscriptions():
 
 @bot.message_handler(commands=['status'])
 def handle_status(message):
-    """Отправка текущего статуса зон"""
     user_id = message.chat.id
 
     if not check_subscription(user_id):
         return
 
     try:
+        # Начальное сообщение с прогресс-баром
+        progress_msg = bot.send_message(user_id,
+                                        "🔄 *Запуск процесса формирования отчета:*\n"
+                                        "________________________________\n"
+                                        "▰▱▱▱▱▱▱▱▱▱ 10%",
+                                        parse_mode='Markdown')
+
+        # Шаг 1: Получение данных
+        edit_progress(progress_msg,
+                      "📡 *Получаем последние координаты зон...*\n"
+                      "________________________________\n"
+                      "▰▰▰▱▱▱▱▱▱▱ 30%", 0)
+
         zones = get_user_zones(user_id)
-        driver = init_driver()
-        screenshot_path, _, _ = process_map(driver, get_user_map_link(user_id))
+        if not zones:
+            edit_progress(progress_msg,
+                          "❌ *Нет данных о зонах!*\n"
+                          "Первая проверка будет выполнена в течение 2 минут",
+                          100)
+            return
+
+        # Шаг 2: Загрузка карты
+        edit_progress(progress_msg,
+                      "🌍 *Загружаем последнюю версию карты...*\n"
+                      "________________________________\n"
+                      "▰▰▰▰▰▱▱▱▱▱ 50%", 0)
+
+        map_path = f'processed_{user_id}.png'
+        if not os.path.exists(map_path):
+            edit_progress(progress_msg,
+                          "❌ *Карта не найдена!*\n"
+                          "Ожидайте следующей проверки",
+                          100)
+            return
+
+        # Шаг 3: Визуализация
+        edit_progress(progress_msg,
+                      "🎨 *Визуализируем изменения...*\n"
+                      "________________________________\n"
+                      "▰▰▰▰▰▰▰▱▱▱ 70%", 0)
+
+        img = cv2.imread(map_path)
+        timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+        # Добавляем текст на изображение
+        cv2.putText(img, f"Status: {timestamp}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Сохраняем временный файл
+        temp_path = f'status_temp_{user_id}.png'
+        cv2.imwrite(temp_path, img)
+
+        # Шаг 4: Формирование отчета
+        edit_progress(progress_msg,
+                      "📊 *Анализируем данные...*\n"
+                      "________________________________\n"
+                      "▰▰▰▰▰▰▰▰▰▱ 90%", 1)
 
         status_text = (
-            f"📊 Текущий статус:\n"
-            f"Всего зон: {len(zones)}\n"
-            f"Последняя проверка: {datetime.now().strftime('%H:%M:%S')}\n\n"
+            f"📋 *Детальный отчет*\n"
+            f"• Всего зон: {len(zones)}\n"
+            f"• Последнее обновление: {timestamp}\n"
+            f"• Следующая проверка через: 2 минуты\n\n"
             f"{COLOR_LEGEND}"
         )
 
-        with open(screenshot_path, 'rb') as screenshot:
-            bot.send_photo(user_id, screenshot, caption=status_text)
+        # Отправка финального сообщения
+        with open(temp_path, 'rb') as photo:
+            bot.send_photo(user_id, photo,
+                           caption=status_text,
+                           parse_mode='Markdown')
+
+        # Финализация прогресса
+        edit_progress(progress_msg,
+                      "✅ *Отчет успешно сформирован!*\n"
+                      "________________________________\n"
+                      "▰▰▰▰▰▰▰▰▰▰ 100%", 0)
+
+        # Удаление временного файла
+        os.remove(temp_path)
 
     except Exception as e:
-        bot.send_message(user_id, f"⚠️ Ошибка получения статуса: {str(e)}")
+        error_msg = (
+            "⚠️ *Ошибка формирования отчета!*\n"
+            f"Причина: {str(e)}\n"
+            "Попробуйте снова через 2 минуты"
+        )
+        if 'progress_msg' in locals():
+            edit_progress(progress_msg, error_msg, 100)
+        else:
+            bot.send_message(user_id, error_msg, parse_mode='Markdown')
+        logger.error(f"Status error: {str(e)}")
+
+
+def edit_progress(message, text, delay=0):
+    """Обновление сообщения с прогрессом"""
+    time.sleep(delay)
+    try:
+        bot.edit_message_text(
+            text,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning(f"Progress update error: {str(e)}")
 
 
 @bot.message_handler(func=lambda message: message.text.startswith("http"))
@@ -634,7 +726,7 @@ def handle_map_link(message):
 
     driver = init_driver()
     try:
-        screenshot_path, zones, original_path = process_map(driver, map_link)
+        screenshot_path, zones, original_path = process_map(driver, map_link, user_id)
         save_zones_to_db(user_id, zones)
 
         markup = InlineKeyboardMarkup()
@@ -676,7 +768,7 @@ def handle_confirmation(call):
     bot.send_message(
         user_id,
         f"✅ Мониторинг активирован до {new_end_date.strftime('%d.%m.%Y')}\n"
-        "🔍 Изменения проверяются каждые 30 секунд"
+        "🔍 Изменения проверяются каждые 2 минуты"
     )
 
 
@@ -694,4 +786,3 @@ if __name__ == "__main__":
         logger.critical(f"Критическая ошибка: {str(e)}")
     finally:
         logger.info("Завершение работы бота")
-
