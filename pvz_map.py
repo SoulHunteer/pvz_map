@@ -1,16 +1,22 @@
 import logging
 import sqlite3
 from datetime import datetime, timedelta
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import asyncio
+import aiosqlite
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-import threading
-import time
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import cv2
 import numpy as np
 import os
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 load_dotenv()
 
@@ -25,9 +31,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-bot = telebot.TeleBot(token=TELEGRAM_TOKEN)
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
+# Пул потоков для CPU-bound задач
+executor = ThreadPoolExecutor(max_workers=4)
+selenium_executor = ThreadPoolExecutor(max_workers=2)
 
 COLOR_LEGEND = (
     "🎨 Цветовая легенда:\n"
@@ -36,46 +46,44 @@ COLOR_LEGEND = (
     "⚫ Черный - удаленные зоны"
 )
 
+
 # Инициализация базы данных
-def init_db():
+async def init_db():
     """
     Инициализирует базу данных SQLite
     Создает таблицы users и pixel_zones при первом запуске
     """
     logger.info("Инициализация базы данных...")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL UNIQUE,
-                            role TEXT NOT NULL DEFAULT 'user',
-                            map_link TEXT,
-                            tariff_end_date TEXT,
-                            is_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
-                            notified BOOLEAN NOT NULL DEFAULT FALSE
-                        )''')
+    async with aiosqlite.connect('users.db') as conn:
+        try:
+            await conn.execute('''CREATE TABLE IF NOT EXISTS users (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                user_id INTEGER NOT NULL UNIQUE,
+                                role TEXT NOT NULL DEFAULT 'user',
+                                map_link TEXT,
+                                tariff_end_date TEXT,
+                                is_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+                                notified BOOLEAN NOT NULL DEFAULT FALSE
+                            )''')
 
-        cursor.execute('''CREATE TABLE IF NOT EXISTS pixel_zones (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            x INTEGER NOT NULL,
-                            y INTEGER NOT NULL,
-                            radius INTEGER NOT NULL,
-                            user_id INTEGER,
-                            FOREIGN KEY (user_id) REFERENCES users(user_id),
-                            UNIQUE(x, y, radius, user_id)
-                        )''')
+            await conn.execute('''CREATE TABLE IF NOT EXISTS pixel_zones (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                x INTEGER NOT NULL,
+                                y INTEGER NOT NULL,
+                                radius INTEGER NOT NULL,
+                                user_id INTEGER,
+                                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                                UNIQUE(x, y, radius, user_id)
+                            )''')
 
-        conn.commit()
-        logger.info("База данных успешно инициализирована")
-    except Exception as e:
-        logger.error(f"Ошибка инициализации БД: {str(e)}")
-    finally:
-        conn.close()
+            await conn.commit()
+            logger.info("База данных успешно инициализирована")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации БД: {str(e)}")
 
 
 # Добавление/обновление пользователя
-def save_user(user_id, **kwargs):
+async def save_user(user_id, **kwargs):
     """
     Сохраняет или обновляет данные пользователя в БД
 
@@ -88,72 +96,62 @@ def save_user(user_id, **kwargs):
         - notified (bool): Флаг отправки уведомления
     """
     logger.info(f"Сохранение пользователя {user_id}: {kwargs}")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT map_link FROM users WHERE user_id = ?", (user_id,))
-        existing_user = cursor.fetchone()
+    async with aiosqlite.connect('users.db') as conn:
+        cursor = await conn.cursor()
+        try:
+            await cursor.execute("SELECT map_link FROM users WHERE user_id = ?", (user_id,))
+            existing_user = await cursor.fetchone()
 
-        if existing_user and 'map_link' in kwargs and existing_user[0] != kwargs['map_link']:
-            logger.info(f"Обновление карты для пользователя {user_id}")
-            delete_all_zones_for_user(user_id)
+            if existing_user and 'map_link' in kwargs and existing_user[0] != kwargs['map_link']:
+                logger.info(f"Обновление карты для пользователя {user_id}")
+                await delete_all_zones_for_user(user_id)
 
-        if not existing_user:
-            logger.info(f"Новый пользователь {user_id}")
-            default_end_date = datetime.now() + timedelta(days=3)
-            cursor.execute(
-                "INSERT INTO users (user_id, map_link, tariff_end_date) VALUES (?, ?, ?)",
-                (user_id, kwargs.get('map_link', ""), default_end_date.strftime('%Y-%m-%d'))
-            )
+            if not existing_user:
+                default_end_date = datetime.now() + timedelta(days=3)
+                await cursor.execute(
+                    "INSERT INTO users (user_id, map_link, tariff_end_date) VALUES (?, ?, ?)",
+                    (user_id, kwargs.get('map_link', ""), default_end_date.strftime('%Y-%m-%d'))
+                )
 
-        updates = []
-        params = []
-        for key, value in kwargs.items():
-            if value is not None:
-                updates.append(f"{key} = ?")
-                params.append(value)
+            updates = []
+            params = []
+            for key, value in kwargs.items():
+                if value is not None:
+                    updates.append(f"{key} = ?")
+                    params.append(value)
 
-        if updates:
-            update_query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
-            params.append(user_id)
-            cursor.execute(update_query, params)
+            if updates:
+                update_query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+                params.append(user_id)
+                await cursor.execute(update_query, params)
 
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Ошибка сохранения пользователя {user_id}: {str(e)}")
-    finally:
-        conn.close()
+            await conn.commit()
+        except Exception as e:
+            logger.error(f"Ошибка сохранения пользователя {user_id}: {str(e)}")
 
 
-def check_subscription(user_id):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''SELECT tariff_end_date, notified, is_confirmed 
-                    FROM users 
-                    WHERE user_id = ?''', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
+async def check_subscription(user_id):
+    async with aiosqlite.connect('users.db') as conn:
+        cursor = await conn.cursor()
+        await cursor.execute('''SELECT tariff_end_date, notified, is_confirmed 
+                              FROM users 
+                              WHERE user_id = ?''', (user_id,))
+        result = await cursor.fetchone()
 
     if not result:
         return True
 
     end_date, notified, is_confirmed = result
-
-    # Проверка подтверждения карты
-    # if not is_confirmed:
-    #     return False
-
-    # Проверка даты подписки
     if end_date and datetime.strptime(end_date, '%Y-%m-%d') < datetime.now():
-        # if not notified:
-        bot.send_message(user_id, "🚫 Подписка истекла! Для продления свяжитесь с администратором.")
-        save_user(user_id, notified=True)
+        if not notified:
+            await bot.send_message(user_id, "🚫 Подписка истекла! Для продления свяжитесь с администратором.")
+            await save_user(user_id, notified=True)
         return False
     return True
 
 
 # Сохранение зон в БД
-def save_zones_to_db(user_id, zones):
+async def save_zones_to_db(user_id, zones):
     """
     Сохраняет обнаруженные зоны в базу данных
 
@@ -165,22 +163,21 @@ def save_zones_to_db(user_id, zones):
     None
     """
     logger.info(f"Сохранение {len(zones)} зон для пользователя {user_id}")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    try:
-        for zone in zones:
-            cursor.execute("INSERT OR IGNORE INTO pixel_zones (x, y, radius, user_id) VALUES (?, ?, ?, ?)",
-                           (zone['x'], zone['y'], zone['radius'], user_id))
-        conn.commit()
-        logger.info(f"Успешно сохранено зон: {len(zones)}")
-    except Exception as e:
-        logger.error(f"Ошибка сохранения зон для {user_id}: {str(e)}")
-    finally:
-        conn.close()
+    async with aiosqlite.connect('users.db') as conn:
+        try:
+            for zone in zones:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO pixel_zones (x, y, radius, user_id) VALUES (?, ?, ?, ?)",
+                    (zone['x'], zone['y'], zone['radius'], user_id)
+                )
+            await conn.commit()
+            logger.info(f"Успешно сохранено зон: {len(zones)}")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения зон для {user_id}: {str(e)}")
 
 
 # Удаление зон из БД
-def delete_zones_from_db(user_id, zones):
+async def delete_zones_from_db(user_id, zones):
     """
     Удаляет указанные зоны из базы данных
 
@@ -192,23 +189,20 @@ def delete_zones_from_db(user_id, zones):
     None
     """
     logger.info(f"Удаление {len(zones)} зон для пользователя {user_id}")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    try:
-        for (x, y, radius) in zones:
-            cursor.execute(
-                "DELETE FROM pixel_zones WHERE user_id = ? AND x = ? AND y = ? AND radius = ?",
-                (user_id, x, y, radius)
-            )
-        conn.commit()
-        logger.info(f"Успешно удалено зон: {len(zones)}")
-    except Exception as e:
-        logger.error(f"Ошибка удаления зон для {user_id}: {str(e)}")
-    finally:
-        conn.close()
+    async with aiosqlite.connect('users.db') as conn:
+        try:
+            for (x, y, radius) in zones:
+                await conn.execute(
+                    "DELETE FROM pixel_zones WHERE user_id = ? AND x = ? AND y = ? AND radius = ?",
+                    (user_id, x, y, radius)
+                )
+            await conn.commit()
+            logger.info(f"Успешно удалено зон: {len(zones)}")
+        except Exception as e:
+            logger.error(f"Ошибка удаления зон для {user_id}: {str(e)}")
 
 
-def delete_all_zones_for_user(user_id):
+async def delete_all_zones_for_user(user_id):
     """
     Удаляет все зоны, связанные с указанным пользователем
 
@@ -219,20 +213,16 @@ def delete_all_zones_for_user(user_id):
     None
     """
     logger.info(f"Удаление всех зон для пользователя {user_id}")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    try:
-        cursor.execute("DELETE FROM pixel_zones WHERE user_id = ?", (user_id,))
-        conn.commit()
-        logger.info(f"Удалено зон: {cursor.rowcount}")
-    except Exception as e:
-        logger.error(f"Ошибка удаления зон для {user_id}: {str(e)}")
-    finally:
-        conn.close()
+    async with aiosqlite.connect('users.db') as conn:
+        try:
+            await conn.execute("DELETE FROM pixel_zones WHERE user_id = ?", (user_id,))
+            await conn.commit()
+        except Exception as e:
+            logger.error(f"Ошибка удаления зон для {user_id}: {str(e)}")
 
 
 # Получение зон из БД
-def get_user_zones(user_id):
+async def get_user_zones(user_id):
     """
     Получает сохраненные зоны пользователя из базы данных
 
@@ -243,18 +233,15 @@ def get_user_zones(user_id):
     list: Список словарей с координатами зон
     """
     logger.info(f"Получение зон для пользователя {user_id}")
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT x, y, radius FROM pixel_zones WHERE user_id = ?", (user_id,))
-        result = cursor.fetchall()
-        logger.info(f"Найдено зон: {len(result)}")
-        return [{'x': row[0], 'y': row[1], 'radius': row[2]} for row in result]
-    except Exception as e:
-        logger.error(f"Ошибка получения зон для {user_id}: {str(e)}")
-        return []
-    finally:
-        conn.close()
+    async with aiosqlite.connect('users.db') as conn:
+        cursor = await conn.cursor()
+        try:
+            await cursor.execute("SELECT x, y, radius FROM pixel_zones WHERE user_id = ?", (user_id,))
+            result = await cursor.fetchall()
+            return [{'x': row[0], 'y': row[1], 'radius': row[2]} for row in result]
+        except Exception as e:
+            logger.error(f"Ошибка получения зон для {user_id}: {str(e)}")
+            return []
 
 
 # Сравнение зон с погрешностью в 1 пиксель
@@ -326,12 +313,11 @@ def init_driver():
 
 
 # Обработка карты
-def process_map(driver, map_link, user_id):
+def process_map_sync(map_link, user_id):
     """
     Обрабатывает карту по указанной ссылке
 
     Параметры:
-    driver (WebDriver): Экземпляр Selenium WebDriver
     map_link (str): URL-адрес карты
     user_id: User id
 
@@ -339,25 +325,49 @@ def process_map(driver, map_link, user_id):
     tuple: (screenshot_path, zones, original_path)
     """
     logger.info(f"Обработка карты: {map_link}")
+    driver = init_driver()
     try:
         driver.get(map_link)
-        time.sleep(5)
-        driver.find_element(By.CLASS_NAME, 'ant-drawer-close').click()
-        time.sleep(1)
-        screenshot, _ = take_screenshot(driver)
-        # Сохраняем оригинал и обработанное изображение с привязкой к user_id
+
+        # Ожидание полной загрузки страницы
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, 'body'))
+        )
+
+        # Закрытие попапа
+        try:
+            close_button = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CLASS_NAME, 'ant-drawer-close'))
+            )
+            close_button.click()
+            time.sleep(1)
+        except Exception as e:
+            logger.warning(f"Не удалось закрыть попап: {str(e)}")
+
+        # Создание скриншота
+        screenshot = take_screenshot(driver)
+
+        # Проверка валидности изображения
+        if not isinstance(screenshot, np.ndarray):
+            raise ValueError("Invalid screenshot format")
+
+        # Сохранение файлов
         original_path = f'original_{user_id}.png'
         processed_path = f'processed_{user_id}.png'
 
         cv2.imwrite(original_path, screenshot)
-        zones = process_image(screenshot)
-        save_image_with_zones(screenshot, zones, processed_path)
 
-        logger.info(f"Обнаружено зон: {len(zones)}")
+        # Обработка зон
+        zones = process_image(screenshot)
+        save_image_with_zones(screenshot.copy(), zones, processed_path)
+
         return processed_path, zones, original_path
+
     except Exception as e:
         logger.error(f"Ошибка обработки карты: {str(e)}")
         raise
+    finally:
+        driver.quit()
 
 
 # Скриншот страницы
@@ -373,15 +383,25 @@ def take_screenshot(driver):
     """
     logger.info("Создание скриншота страницы")
     try:
-        window_size = driver.execute_script("return [window.innerWidth, window.innerHeight];")
-        screenshot = driver.get_screenshot_as_png()
-        screenshot_np = np.frombuffer(screenshot, np.uint8)
-        image = cv2.imdecode(screenshot_np, cv2.IMREAD_COLOR)
-        return image, window_size
+        driver.set_window_size(1280, 720)
+        time.sleep(1)  # Даем время для применения размера
+
+        # Получаем скриншот как PNG
+        screenshot_data = driver.get_screenshot_as_png()
+
+        # Конвертируем в numpy array
+        nparr = np.frombuffer(screenshot_data, np.uint8)
+
+        # Декодируем изображение
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            raise ValueError("Failed to decode screenshot image")
+
+        return img
     except Exception as e:
         logger.error(f"Ошибка создания скриншота: {str(e)}")
         raise
-
 
 # Обработка изображения
 def process_image(image):
@@ -437,74 +457,72 @@ def save_image_with_zones(image, zones, path):
         raise
 
 
+# Асинхронные обертки для синхронных функций
+async def run_in_threadpool(executor, func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, func, *args)
+
+
+
+async def process_map_async(map_link, user_id):
+    return await run_in_threadpool(selenium_executor, process_map_sync, map_link, user_id)
+
+
 # Фоновая проверка зон
-def background_check():
+async def background_check():
     """
     Фоновая задача для периодической проверки изменений зон
     Запускается каждые 30 секунд
     """
     logger.info("Запуск фоновой проверки")
-    try:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('''SELECT user_id, map_link 
-                        FROM users 
-                        WHERE is_confirmed = TRUE and notified = FALSE''')
-        users = cursor.fetchall()
-        conn.close()
+    while True:
+        try:
+            async with aiosqlite.connect('users.db') as conn:
+                cursor = await conn.cursor()
+                await cursor.execute('''SELECT user_id, map_link 
+                                          FROM users 
+                                          WHERE is_confirmed = TRUE 
+                                          AND notified = FALSE''')
+                users = await cursor.fetchall()
 
-        for user_id, map_link in users:
-            if not check_subscription(user_id):
-                continue
+                for user_id, map_link in users:
+                    try:
+                        # Получаем текущие зоны
+                        old_zones = await get_user_zones(user_id)
 
-            driver = init_driver()
-            try:
-                old_zones = get_user_zones(user_id)
-                screenshot_path, new_zones, original_path = process_map(driver, map_link, user_id)
-                added, removed = compare_zones(old_zones, new_zones)
+                        # Обрабатываем карту
+                        diff_path, new_zones, original_path = await process_map_async(map_link, user_id)
 
-                if added or removed:
-                    save_zones_to_db(user_id, new_zones)
-                    delete_zones_from_db(user_id, removed)
+                        # Сравниваем зоны
+                        added, removed = await run_in_threadpool(
+                            executor,
+                            compare_zones,
+                            old_zones,
+                            new_zones
+                        )
 
-                    # Генерация изображения с изменениями
-                    original_image = cv2.imread(original_path)
+                        if added or removed:
+                            # Отправляем уведомление
+                            with open(diff_path, 'rb') as photo:
+                                await bot.send_photo(
+                                    user_id,
+                                    types.BufferedInputFile(photo.read(), filename="changes.png"),
+                                    caption=f"🔔 Обнаружены изменения!\n"
+                                            f"➕ Новых зон: {len(added)}\n"
+                                            f"➖ Удаленных зон: {len(removed)}"
+                                )
 
-                    # Рисуем текущие зоны зеленым
-                    for zone in new_zones:
-                        cv2.circle(original_image, (zone['x'], zone['y']), zone['radius'], (0, 255, 0), 2)
+                        # Обновляем БД
+                        await save_zones_to_db(user_id, new_zones)
+                        await delete_zones_from_db(user_id, removed)
 
-                    # Добавляем новые зоны красным
-                    for (x, y, radius) in added:
-                        cv2.circle(original_image, (x, y), radius, (0, 0, 255), 2)
+                    except Exception as e:
+                        logger.error(f"User {user_id} check error: {str(e)}")
 
-                    # Помечаем удаленные зоны черным
-                    for (x, y, radius) in removed:
-                        cv2.circle(original_image, (x, y), radius, (0, 0, 0), 2)
+        except Exception as e:
+            logger.error(f"Background check error: {str(e)}")
 
-                    diff_path = 'diff_image.png'
-                    cv2.imwrite(diff_path, original_image)
-
-                    caption = "Обнаружены изменения в зонах!\n\n"
-                    if added:
-                        caption += f"Добавлено зон: {len(added)}\n"
-                    if removed:
-                        caption += f"Удалено зон: {len(removed)}\n"
-                    caption += COLOR_LEGEND
-
-                    with open(diff_path, 'rb') as diff_img:
-                        bot.send_photo(user_id, diff_img, caption=caption)
-
-            except Exception as e:
-                print(f"Ошибка при проверке: {e}")
-            finally:
-                driver.quit()
-
-    except Exception as e:
-        logger.error(f"Ошибка фоновой проверки: {str(e)}")
-    finally:
-        logger.info("Завершение фоновой проверки")
-        threading.Timer(30, background_check).start()
+        await asyncio.sleep(120)  # Интервал проверки 2 минуты
 
 
 # Проверка истёкших подписок
@@ -530,13 +548,8 @@ def background_check():
 
 
 # Обработка команды /start
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    """
-    Обработчик команды /start
-    Отправляет приветственное сообщение и кнопку
-    """
-    logger.info(f"Сообщение от пользователя: {message.chat.id}")
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
     welcome_text = (
         "🌍 Система мониторинга зон\n\n"
         "📌 Отправьте ссылку на карту\n"
@@ -544,10 +557,13 @@ def send_welcome(message):
         "🔔 Изменения проверяются каждые 2 минуты"
     )
 
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Отправить карту", callback_data="send_map"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Отправить карту", callback_data="send_map")
 
-    bot.send_message(message.chat.id, welcome_text, reply_markup=markup)
+    await message.answer(
+        welcome_text,
+        reply_markup=builder.as_markup()
+    )
 
 
 def get_user_map_link(user_id):
@@ -570,219 +586,183 @@ def get_user_map_link(user_id):
 
 
 # Новая функция проверки истёкших тарифов
-def check_expired_subscriptions():
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''SELECT user_id 
-                    FROM users 
-                    WHERE is_confirmed = TRUE 
-                    AND tariff_end_date < ?''',
-                   (datetime.now().strftime('%Y-%m-%d'),))
+async def check_expired_subscriptions():
+    """Проверка истекших подписок"""
+    while True:
+        try:
+            async with aiosqlite.connect('users.db') as conn:
+                cursor = await conn.cursor()
+                await cursor.execute('''SELECT user_id 
+                                      FROM users 
+                                      WHERE is_confirmed = TRUE 
+                                      AND tariff_end_date < ?''',
+                                     (datetime.now().strftime('%Y-%m-%d'),))
 
-    expired_users = cursor.fetchall()
-    for (user_id,) in expired_users:
-        bot.send_message(
-            user_id,
-            "🚫 Ваша пробная подписка истекла. Для продолжения работы обратитесь в поддержку."
-        )
-        save_user(user_id, is_confirmed=False)
+                expired_users = await cursor.fetchall()
+                for (user_id,) in expired_users:
+                    await bot.send_message(
+                        user_id,
+                        "🚫 Ваша пробная подписка истекла. Для продолжения работы обратитесь в поддержку."
+                    )
+                    await save_user(user_id, is_confirmed=False)
 
-    conn.close()
-    threading.Timer(86400, check_expired_subscriptions).start()  # Проверка раз в сутки
+        except Exception as e:
+            logger.error(f"Subscription check error: {str(e)}")
+
+        await asyncio.sleep(86400)  # Проверка раз в сутки
 
 
-@bot.message_handler(commands=['status'])
-def handle_status(message):
+@dp.message(Command("status"))
+async def handle_status(message: types.Message):
     user_id = message.chat.id
 
-    if not check_subscription(user_id):
+    if not await check_subscription(user_id):
         return
 
     try:
-        # Начальное сообщение с прогресс-баром
-        progress_msg = bot.send_message(user_id,
-                                        "🔄 *Запуск процесса формирования отчета:*\n"
-                                        "________________________________\n"
-                                        "▰▱▱▱▱▱▱▱▱▱ 10%",
-                                        parse_mode='Markdown')
+        # Отправляем начальное сообщение с прогресс-баром
+        progress_msg = await message.answer(
+            "🔄 *Запуск процесса формирования отчета:*\n"
+            "________________________________\n"
+            "▰▱▱▱▱▱▱▱▱▱ 10%",
+            parse_mode='Markdown'
+        )
 
-        # Шаг 1: Получение данных
-        edit_progress(progress_msg,
-                      "📡 *Получаем последние координаты зон...*\n"
-                      "________________________________\n"
-                      "▰▰▰▱▱▱▱▱▱▱ 30%", 0)
-
-        zones = get_user_zones(user_id)
+        # Получаем зоны асинхронно
+        zones = await get_user_zones(user_id)
         if not zones:
-            edit_progress(progress_msg,
-                          "❌ *Нет данных о зонах!*\n"
-                          "Первая проверка будет выполнена в течение 2 минут",
-                          100)
+            await progress_msg.edit_text(
+                "❌ *Нет данных о зонах!*\n"
+                "Первая проверка будет выполнена в течение 2 минут",
+                parse_mode='Markdown'
+            )
             return
 
-        # Шаг 2: Загрузка карты
-        edit_progress(progress_msg,
-                      "🌍 *Загружаем последнюю версию карты...*\n"
-                      "________________________________\n"
-                      "▰▰▰▰▰▱▱▱▱▱ 50%", 0)
+        # Обрабатываем изображение в отдельном потоке
+        processed_image = await run_in_threadpool(
+            executor,
+            generate_status_image,
+            user_id,
+            zones
+        )
 
-        map_path = f'processed_{user_id}.png'
-        if not os.path.exists(map_path):
-            edit_progress(progress_msg,
-                          "❌ *Карта не найдена!*\n"
-                          "Ожидайте следующей проверки",
-                          100)
-            return
-
-        # Шаг 3: Визуализация
-        edit_progress(progress_msg,
-                      "🎨 *Визуализируем изменения...*\n"
-                      "________________________________\n"
-                      "▰▰▰▰▰▰▰▱▱▱ 70%", 0)
-
-        img = cv2.imread(map_path)
-        timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-
-        # Добавляем текст на изображение
-        cv2.putText(img, f"Status: {timestamp}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-        # Сохраняем временный файл
-        temp_path = f'status_temp_{user_id}.png'
-        cv2.imwrite(temp_path, img)
-
-        # Шаг 4: Формирование отчета
-        edit_progress(progress_msg,
-                      "📊 *Анализируем данные...*\n"
-                      "________________________________\n"
-                      "▰▰▰▰▰▰▰▰▰▱ 90%", 1)
-
+        # Отправляем результат
         status_text = (
             f"📋 *Детальный отчет*\n"
             f"• Всего зон: {len(zones)}\n"
-            f"• Последнее обновление: {timestamp}\n"
+            f"• Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
             f"• Следующая проверка через: 2 минуты\n\n"
             f"{COLOR_LEGEND}"
         )
 
-        # Отправка финального сообщения
-        with open(temp_path, 'rb') as photo:
-            bot.send_photo(user_id, photo,
-                           caption=status_text,
-                           parse_mode='Markdown')
-
-        # Финализация прогресса
-        edit_progress(progress_msg,
-                      "✅ *Отчет успешно сформирован!*\n"
-                      "________________________________\n"
-                      "▰▰▰▰▰▰▰▰▰▰ 100%", 0)
-
-        # Удаление временного файла
-        os.remove(temp_path)
-
-    except Exception as e:
-        error_msg = (
-            "⚠️ *Ошибка формирования отчета!*\n"
-            f"Причина: {str(e)}\n"
-            "Попробуйте снова через 2 минуты"
-        )
-        if 'progress_msg' in locals():
-            edit_progress(progress_msg, error_msg, 100)
-        else:
-            bot.send_message(user_id, error_msg, parse_mode='Markdown')
-        logger.error(f"Status error: {str(e)}")
-
-
-def edit_progress(message, text, delay=0):
-    """Обновление сообщения с прогрессом"""
-    time.sleep(delay)
-    try:
-        bot.edit_message_text(
-            text,
-            chat_id=message.chat.id,
-            message_id=message.message_id,
+        await message.answer_photo(
+            types.BufferedInputFile(processed_image, filename="status.png"),
+            caption=status_text,
             parse_mode='Markdown'
         )
+
+        await progress_msg.delete()
+
     except Exception as e:
-        logger.warning(f"Progress update error: {str(e)}")
+        logger.error(f"Status error: {str(e)}")
+        await message.answer("⚠️ Произошла ошибка при формировании отчета")
 
 
-@bot.message_handler(func=lambda message: message.text.startswith("http"))
-def handle_map_link(message):
-    """
-    Обработчик для входящих ссылок на карты
-    """
-    logger.info(f"Обработка карты от пользователя {message.chat.id}")
+def generate_status_image(user_id, zones):
+    """Синхронная генерация изображения статуса"""
+    map_path = f'processed_{user_id}.png'
+    if not os.path.exists(map_path):
+        return None
+
+    img = cv2.imread(map_path)
+    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    cv2.putText(img, f"Status: {timestamp}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    temp_path = f'status_temp_{user_id}.png'
+    cv2.imwrite(temp_path, img)
+
+    with open(temp_path, 'rb') as f:
+        image_data = f.read()
+
+    os.remove(temp_path)
+    return image_data
+
+
+# def edit_progress(message, text, delay=0):
+#     """Обновление сообщения с прогрессом"""
+#     time.sleep(delay)
+#     try:
+#         bot.edit_message_text(
+#             text,
+#             chat_id=message.chat.id,
+#             message_id=message.message_id,
+#             parse_mode='Markdown'
+#         )
+#     except Exception as e:
+#         logger.warning(f"Progress update error: {str(e)}")
+
+
+@dp.message(lambda message: message.text.startswith("http"))
+async def handle_map_link(message: types.Message):
     user_id = message.chat.id
     map_link = message.text
 
-    if not check_subscription(user_id):
+    if not await check_subscription(user_id):
         return
 
-    # Для новых пользователей создаем запись с подпиской
-    save_user(user_id, map_link=map_link, notified=False)
+    await save_user(user_id, map_link=map_link, notified=False)
+    await message.answer("🔄 Обрабатываю карту...")
 
-    bot.send_message(user_id, "🔄 Обрабатываю карту...")
-
-    driver = init_driver()
     try:
-        screenshot_path, zones, original_path = process_map(driver, map_link, user_id)
-        save_zones_to_db(user_id, zones)
+        processed_path, zones, _ = await process_map_async(map_link, user_id)
+        await save_zones_to_db(user_id, zones)
 
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("Активировать мониторинг", callback_data="confirm"),
-            InlineKeyboardButton("Отмена", callback_data="cancel")
-        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Активировать мониторинг", callback_data="confirm")
+        builder.button(text="Отмена", callback_data="cancel")
 
-        with open(screenshot_path, 'rb') as screenshot:
-            bot.send_photo(
-                user_id,
-                screenshot,
+        with open(processed_path, 'rb') as photo:
+            await message.answer_photo(
+                types.BufferedInputFile(photo.read(), filename="map.png"),
                 caption="📍 Карта готова! Подтвердите активацию мониторинга",
-                reply_markup=markup
+                reply_markup=builder.as_markup()
             )
 
     except Exception as e:
-        bot.send_message(user_id, f"⚠️ Ошибка: {str(e)}")
-    finally:
-        driver.quit()
+        logger.error(f"Map processing error: {str(e)}")
+        await message.answer(f"⚠️ Ошибка обработки карты: {str(e)}")
 
 
-@bot.callback_query_handler(func=lambda call: call.data == 'confirm')
-def handle_confirmation(call):
-    user_id = call.message.chat.id
-    # Обновляем подписку при подтверждении
+# Обработчики колбэков
+@dp.callback_query(lambda c: c.data == 'confirm')
+async def handle_confirmation(callback: types.CallbackQuery):
+    user_id = callback.message.chat.id
     new_end_date = datetime.now() + timedelta(days=3)
-    save_user(user_id,
-              is_confirmed=True,
-              tariff_end_date=new_end_date.strftime('%Y-%m-%d'),
-              notified=False)
 
-    bot.edit_message_reply_markup(
-        chat_id=user_id,
-        message_id=call.message.message_id,
-        reply_markup=None
-    )
+    await save_user(user_id,
+                    is_confirmed=True,
+                    tariff_end_date=new_end_date.strftime('%Y-%m-%d'),
+                    notified=False)
 
-    bot.send_message(
-        user_id,
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
         f"✅ Мониторинг активирован до {new_end_date.strftime('%d.%m.%Y')}\n"
         "🔍 Изменения проверяются каждые 2 минуты"
     )
 
 
+@dp.callback_query(lambda c: c.data == 'cancel')
+async def handle_cancel(callback: types.CallbackQuery):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Активация мониторинга отменена")
+
+
+async def main():
+    await init_db()
+    asyncio.create_task(background_check())
+    asyncio.create_task(check_expired_subscriptions())
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    """
-    Основная точка входа в приложение
-    """
-    logger.info("Запуск бота...")
-    try:
-        init_db()
-        # check_expired_subscriptions()
-        background_check()
-        bot.infinity_polling()
-    except Exception as e:
-        logger.critical(f"Критическая ошибка: {str(e)}")
-    finally:
-        logger.info("Завершение работы бота")
+    asyncio.run(main())
