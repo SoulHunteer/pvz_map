@@ -143,9 +143,8 @@ async def check_subscription(user_id):
 
     end_date, notified, is_confirmed = result
     if end_date and datetime.strptime(end_date, '%Y-%m-%d') < datetime.now():
-        if not notified:
-            await bot.send_message(user_id, "🚫 Подписка истекла! Для продления свяжитесь с администратором.")
-            await save_user(user_id, notified=True)
+        await bot.send_message(user_id, "🚫 Подписка истекла! Для продления свяжитесь с администратором.")
+        await save_user(user_id, notified=True)
         return False
     return True
 
@@ -244,6 +243,13 @@ async def get_user_zones(user_id):
             return []
 
 
+def is_zone_similar(z1, z2):
+    """Проверка схожести зон с погрешностью 1px"""
+    return (abs(z1['x'] - z2['x']) <= 1 and
+            abs(z1['y'] - z2['y']) <= 1 and
+            abs(z1['radius'] - z2['radius']) <= 1)
+
+
 # Сравнение зон с погрешностью в 1 пиксель
 def compare_zones(old_zones, new_zones):
     """
@@ -262,33 +268,15 @@ def compare_zones(old_zones, new_zones):
 
     # Ищем новые зоны
     for new_zone in new_zones:
-        has_close_match = False
-        for old_zone in old_zones:
-            if (abs(new_zone['x'] - old_zone['x']) <= 1 and
-                    abs(new_zone['y'] - old_zone['y']) <= 1 and
-                    abs(new_zone['radius'] - old_zone['radius']) <= 1):
-                has_close_match = True
-                break
-        if not has_close_match:
+        if not any(is_zone_similar(new_zone, old_zone) for old_zone in old_zones):
             added.append(new_zone)
 
-    # Ищем удалённые зоны
+    # Ищем удаленные зоны
     for old_zone in old_zones:
-        has_close_match = False
-        for new_zone in new_zones:
-            if (abs(old_zone['x'] - new_zone['x']) <= 1 and
-                    abs(old_zone['y'] - new_zone['y']) <= 1 and
-                    abs(old_zone['radius'] - new_zone['radius']) <= 1):
-                has_close_match = True
-                break
-        if not has_close_match:
+        if not any(is_zone_similar(old_zone, new_zone) for new_zone in new_zones):
             removed.append(old_zone)
 
-    added_set = set((z['x'], z['y'], z['radius']) for z in added)
-    removed_set = set((z['x'], z['y'], z['radius']) for z in removed)
-
-    logger.info(f"Обнаружено изменений: +{len(added)}, -{len(removed)}")
-    return added_set, removed_set
+    return added, removed
 
 
 # Инициализация драйвера
@@ -310,6 +298,24 @@ def init_driver():
     except Exception as e:
         logger.critical(f"Ошибка инициализации драйвера: {str(e)}")
         raise
+
+
+def close_notifications(driver):
+    """Закрытие всплывающих уведомлений"""
+    try:
+        notifications = WebDriverWait(driver, 15).until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, '.ant-notification-notice-close')
+            )
+        )
+        for close_button in notifications:
+            try:
+                driver.execute_script("arguments[0].click();", close_button)
+                time.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"Не удалось закрыть уведомление: {str(e)}")
+    except Exception as e:
+        logger.info("Всплывающие уведомления не найдены")
 
 
 # Обработка карты
@@ -340,7 +346,8 @@ def process_map_sync(map_link, user_id):
                 EC.element_to_be_clickable((By.CLASS_NAME, 'ant-drawer-close'))
             )
             close_button.click()
-            time.sleep(1)
+            time.sleep(5)
+            # close_notifications(driver)
         except Exception as e:
             logger.warning(f"Не удалось закрыть попап: {str(e)}")
 
@@ -403,6 +410,7 @@ def take_screenshot(driver):
         logger.error(f"Ошибка создания скриншота: {str(e)}")
         raise
 
+
 # Обработка изображения
 def process_image(image):
     """
@@ -463,7 +471,6 @@ async def run_in_threadpool(executor, func, *args):
     return await loop.run_in_executor(executor, func, *args)
 
 
-
 async def process_map_async(map_link, user_id):
     return await run_in_threadpool(selenium_executor, process_map_sync, map_link, user_id)
 
@@ -487,22 +494,30 @@ async def background_check():
 
                 for user_id, map_link in users:
                     try:
-                        # Получаем текущие зоны
                         old_zones = await get_user_zones(user_id)
+                        processed_path, new_zones, original_path = await process_map_async(map_link, user_id)
 
-                        # Обрабатываем карту
-                        diff_path, new_zones, original_path = await process_map_async(map_link, user_id)
+                        # Проверка на аномальное уменьшение зон
+                        if (len(new_zones) == 0 and len(new_zones) != 0) or len(new_zones) < len(old_zones) * 0.9:
+                            logger.warning(f"Обнаружено резкое уменьшение зон у {user_id}")
+                            # await bot.send_message(
+                            #     user_id,
+                            #     "⚠️ Обнаружено аномальное изменение зон. Проверка пропущена."
+                            # )
+                            continue
 
-                        # Сравниваем зоны
-                        added, removed = await run_in_threadpool(
-                            executor,
-                            compare_zones,
-                            old_zones,
-                            new_zones
-                        )
+                        added, removed = compare_zones(old_zones, new_zones)
 
                         if added or removed:
-                            # Отправляем уведомление
+                            diff_path = await run_in_threadpool(
+                                executor,
+                                generate_diff_image,
+                                user_id,
+                                new_zones,
+                                added,
+                                removed
+                            )
+
                             with open(diff_path, 'rb') as photo:
                                 await bot.send_photo(
                                     user_id,
@@ -512,9 +527,8 @@ async def background_check():
                                             f"➖ Удаленных зон: {len(removed)}"
                                 )
 
-                        # Обновляем БД
                         await save_zones_to_db(user_id, new_zones)
-                        await delete_zones_from_db(user_id, removed)
+                        await delete_zones_from_db(user_id, {(z['x'], z['y'], z['radius']) for z in removed})
 
                     except Exception as e:
                         logger.error(f"User {user_id} check error: {str(e)}")
@@ -522,7 +536,37 @@ async def background_check():
         except Exception as e:
             logger.error(f"Background check error: {str(e)}")
 
-        await asyncio.sleep(120)  # Интервал проверки 2 минуты
+        await asyncio.sleep(120)
+
+
+def generate_diff_image(user_id, new_zones, added, removed):
+    """Генерация изображения с визуализацией изменений"""
+    original_path = f'original_{user_id}.png'
+    diff_path = f'diff_{user_id}.png'
+
+    if not os.path.exists(original_path):
+        return None
+
+    img = cv2.imread(original_path)
+
+    # 1. Рисуем новые зоны
+    for zone in new_zones:
+        color = (0, 255, 0)  # Зеленый по умолчанию
+        if any(is_zone_similar(zone, a) for a in added):
+            color = (0, 0, 255)  # Красный для новых
+        cv2.circle(img, (zone['x'], zone['y']), zone['radius'], color, 2)
+
+    # 2. Рисуем удаленные зоны поверх
+    for zone in removed:
+        cv2.circle(img, (zone['x'], zone['y']), zone['radius'], (0, 0, 0), 2)
+        # Добавляем перечеркивающую линию
+        cv2.line(img,
+                 (zone['x'] - zone['radius'], zone['y'] - zone['radius']),
+                 (zone['x'] + zone['radius'], zone['y'] + zone['radius']),
+                 (0, 0, 0), 2)
+
+    cv2.imwrite(diff_path, img)
+    return diff_path
 
 
 # Проверка истёкших подписок
@@ -633,7 +677,8 @@ async def handle_status(message: types.Message):
         if not zones:
             await progress_msg.edit_text(
                 "❌ *Нет данных о зонах!*\n"
-                "Первая проверка будет выполнена в течение 2 минут",
+                "Возможно, ещё не прошла первая проверка или фиолетовые зоны отсутствуют по вашей ссылке\n"
+                "Первая проверка выполняется в течении 2 минут",
                 parse_mode='Markdown'
             )
             return
