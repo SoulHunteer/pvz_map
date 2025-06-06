@@ -498,7 +498,7 @@ async def background_check():
                         processed_path, new_zones, original_path = await process_map_async(map_link, user_id)
 
                         # Проверка на аномальное уменьшение зон
-                        if (len(new_zones) == 0 and len(new_zones) != 0) or len(new_zones) < len(old_zones) * 0.9:
+                        if (len(old_zones) != 0 and len(new_zones) == 0) or len(new_zones) < len(old_zones) * 0.9:
                             logger.warning(f"Обнаружено резкое уменьшение зон у {user_id}")
                             # await bot.send_message(
                             #     user_id,
