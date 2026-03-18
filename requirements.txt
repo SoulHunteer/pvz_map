@@ -1,4 +1,11 @@
-numpy==1.24.4
-opencv_python==4.8.1.78
-pyTelegramBotAPI==4.26.0
+﻿aiogram==3.20.0
+aiosqlite==0.21.0
+fastapi==0.115.6
+httpx==0.28.1
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+python-dotenv==1.0.1
 selenium==4.28.1
+SQLAlchemy==2.0.37
+uvicorn==0.34.0
+pytest==8.3.4

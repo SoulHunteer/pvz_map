@@ -1,4 +1,33 @@
-/venv
-/.pytest_cache
-/.idea
-/__pycache__
+﻿# Python
+__pycache__/
+*.pyc
+
+# Virtualenv / IDE
+venv/
+.idea/
+.pytest_cache/
+
+# Secrets
+.env
+
+# Runtime data and logs
+data/app.db
+data/logs/
+data/screenshots/
+data/processed/
+data/diffs/
+
+# Test runtime
+/tests/.runtime/
+pytest-cache-files-*/
+
+# Manual cleanup bucket
+/to_delete_manual/
+
+# Legacy artifacts
+*.png
+bot.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,42 +1,36 @@
-# Используем официальный образ Python
-FROM python:3.11-slim
+﻿FROM python:3.11-slim
 
-# Установка системных зависимостей
-RUN apt-get update && apt-get install -y \
-    wget \
-    unzip \
-    gnupg \
-    libgl1 \
-    libgtk-3-0 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    libglib2.0-0 \
     libnss3 \
+    libx11-6 \
     libx11-xcb1 \
-    xvfb
-
-# Установка Chrome for Testing (новый официальный канал)
-#RUN CHROME_VERSION="132.0.6834.159" && \
-#    wget -O chrome.deb https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${CHROME_VERSION}-1_amd64.deb && \
-#    apt-get install -y ./chrome.deb && \
-#    rm chrome.deb
-
-
-# install google-chrome
-RUN wget  https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-RUN dpkg -i google-chrome-stable_current_amd64.deb || true
-RUN apt update
-RUN apt -f install -y
-
-# Установка ChromeDriver для Chrome for Testing
-RUN CHROME_VERSION="132.0.6834.159" && \
-    wget https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip && \
-    unzip chromedriver-linux64.zip -d /usr/local/bin/ && \
-    mv /usr/local/bin/chromedriver-linux64/chromedriver /usr/local/bin/ && \
-    chmod +x /usr/local/bin/chromedriver && \
-    rm -rf chromedriver-linux64.zip
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    ca-certificates \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
 
-# Запускаем Xvfb в фоне и наш бот
-CMD Xvfb :99 -screen 0 1024x768x16 & python -u pvz_map.py
+ENV CHROME_BINARY_PATH=/usr/bin/chromium \
+    CHROMEDRIVER_PATH=/usr/bin/chromedriver
+
+CMD ["python", "-m", "app.main"]

@@ -1,0 +1,13 @@
+﻿venv/
+.idea/
+.git/
+.gitignore
+
+# Runtime outputs
+__pycache__/
+.pytest_cache/
+data/
+*.png
+bot.log
+users.db
+chromedriver.exe
