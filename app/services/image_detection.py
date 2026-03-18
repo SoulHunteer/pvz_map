@@ -124,8 +124,12 @@ class ZoneDetector:
         # Top-left corner (zoom controls, map logo).
         if bbox_x < 90 and bbox_y < 90:
             return True
-        # Right edge strip (legend, controls).
-        if bbox_x + bbox_w > image_width - 70:
+        # Right edge strip (legend, controls) — only thin elements that look
+        # like UI widgets, not map zones that happen to be near the edge.
+        right_margin = image_width - (bbox_x + bbox_w)
+        if right_margin < 5:
+            return True
+        if right_margin < 70 and bbox_w < 80 and bbox_h < 80:
             return True
 
         # Top-right strip (navigation widgets).
@@ -141,9 +145,16 @@ class ZoneDetector:
             if 1.8 <= aspect <= 6.0:
                 return True
 
-        # Very elongated thin bars (toolbars, status bars).
+        # Very elongated thin bars near image edges (toolbars, status bars).
+        # Do NOT apply in the interior — thin rectangles are valid building zones.
         aspect_ratio = max(bbox_w / max(bbox_h, 1), bbox_h / max(bbox_w, 1))
-        if aspect_ratio > 4.0 and area < 800:
+        near_edge = (
+            bbox_x < 30
+            or bbox_y < 30
+            or bbox_x + bbox_w > image_width - 30
+            or bbox_y + bbox_h > image_height - 30
+        )
+        if aspect_ratio > 4.0 and area < 800 and near_edge:
             return True
 
         # Giant contour spanning most of the image — map background artifact.
@@ -235,19 +246,22 @@ class ZoneDetector:
 
         border_luma = float(0.114 * border_mean[0] + 0.587 * border_mean[1] + 0.299 * border_mean[2])
         center_luma = float(0.114 * center_mean[0] + 0.587 * center_mean[1] + 0.299 * center_mean[2])
-        luma_delta = center_luma - border_luma
+        # Real map zones may be lighter at the centre (classic gradient) OR
+        # darker at the centre (more saturated purple inside).  Use the
+        # absolute brightness difference so both directions pass.
+        luma_diff = abs(center_luma - border_luma)
 
         sat_border = self._distance_to_palette(border_mean, self._saturated_palette)
         sat_center = self._distance_to_palette(center_mean, self._saturated_palette)
         soft_border = self._distance_to_palette(border_mean, self._soft_palette)
         soft_center = self._distance_to_palette(center_mean, self._soft_palette)
 
-        saturated_like = sat_border <= 85.0 and sat_center <= 95.0 and luma_delta >= 3.0
-        soft_like = soft_border <= 70.0 and soft_center <= 70.0 and luma_delta >= 1.0
+        saturated_like = sat_border <= 85.0 and sat_center <= 95.0 and luma_diff >= 2.0
+        soft_like = soft_border <= 70.0 and soft_center <= 70.0 and luma_diff >= 0.5
         mixed_like = (
             min(sat_border, soft_border) <= 80.0
             and min(sat_center, soft_center) <= 80.0
-            and luma_delta >= 1.5
+            and luma_diff >= 1.0
         )
 
         if saturated_like or soft_like or mixed_like:
@@ -265,10 +279,9 @@ class ZoneDetector:
         hue_purple = (
             120 <= border_hsv[0] <= 170
             and 120 <= center_hsv[0] <= 170
-            and border_hsv[1] >= 20
+            and border_hsv[1] >= 15
             and center_hsv[1] >= 15
             and coverage_ratio >= 0.35
-            and luma_delta >= 0.5
         )
         if hue_purple:
             return True
@@ -286,7 +299,6 @@ class ZoneDetector:
             and best_center <= 30.0
             and area >= 200.0
             and compactness <= 0.86
-            and luma_delta >= -1.0
         )
 
     def detect_zones(self, image: np.ndarray) -> list[ZoneGeometry]:
