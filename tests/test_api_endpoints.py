@@ -58,6 +58,9 @@ def test_api_tracked_items_flow(settings):
     assert events.status_code == 200
     assert events.json() == []
 
+    zone_diff_missing = client.get(f"/api/tracked-items/{item_id}/snapshots/999/zone-diff", headers=headers)
+    assert zone_diff_missing.status_code == 404
+
     app.state.mvp_service.run_manual_check = lambda telegram_user_id, tracked_item_id: {
         "tracked_item_id": tracked_item_id,
         "checked_at": "2026-01-01T00:00:00+00:00",

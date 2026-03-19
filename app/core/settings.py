@@ -34,6 +34,7 @@ class Settings:
 
     api_host: str
     api_port: int
+    api_cors_origins: tuple[str, ...]
     dev_auth_enabled: bool
     allowed_telegram_user_ids: tuple[int, ...]
     admin_telegram_user_ids: tuple[int, ...]
@@ -98,12 +99,26 @@ def _get_path(name: str, default: str) -> Path:
         path = (Path.cwd() / path).resolve()
     return path
 
+
+def _get_str_tuple(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    chunks = [item.strip() for item in value.split(",")]
+    items = [item for item in chunks if item]
+    if not items:
+        return default
+
+    return tuple(dict.fromkeys(items))
+
+
 def _get_int_tuple(name: str, default: tuple[int, ...] = ()) -> tuple[int, ...]:
     value = os.getenv(name)
     if value is None:
         return default
 
-    chunks = [item.strip() for item in value.split(',')]
+    chunks = [item.strip() for item in value.split(",")]
     numbers = [int(item) for item in chunks if item]
     if not numbers:
         return default
@@ -145,6 +160,7 @@ def get_settings() -> Settings:
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
         api_host=os.getenv("API_HOST", "0.0.0.0"),
         api_port=_get_int("API_PORT", 8000),
+        api_cors_origins=_get_str_tuple("API_CORS_ORIGINS", ("http://localhost:5173", "http://localhost:3000")),
         dev_auth_enabled=_get_bool("DEV_AUTH_ENABLED", True),
         allowed_telegram_user_ids=_get_int_tuple("ALLOWED_TELEGRAM_USER_IDS", ()),
         admin_telegram_user_ids=_get_int_tuple("ADMIN_TELEGRAM_USER_IDS", ()),
@@ -156,8 +172,8 @@ def get_settings() -> Settings:
         ),
         cv_tolerance=_get_int("CV_TOLERANCE", 28),
         cv_morph_kernel_size=_get_int("CV_MORPH_KERNEL_SIZE", 3),
-        cv_min_area=_get_float("CV_MIN_AREA", 120.0),
-        cv_min_perimeter=_get_float("CV_MIN_PERIMETER", 45.0),
+        cv_min_area=_get_float("CV_MIN_AREA", 40.0),
+        cv_min_perimeter=_get_float("CV_MIN_PERIMETER", 20.0),
         cv_min_compactness=_get_float("CV_MIN_COMPACTNESS", 0.03),
         cv_max_compactness=_get_float("CV_MAX_COMPACTNESS", 0.86),
         cv_mask_mode=os.getenv("CV_MASK_MODE", "bgr").lower(),
@@ -188,7 +204,3 @@ def ensure_directories(settings: Settings) -> None:
     settings.processed_dir.mkdir(parents=True, exist_ok=True)
     settings.diffs_dir.mkdir(parents=True, exist_ok=True)
     settings.logs_dir.mkdir(parents=True, exist_ok=True)
-
-
-
-

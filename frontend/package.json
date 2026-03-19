@@ -1,0 +1,24 @@
+{
+    "name":  "pvz-map-web",
+    "version":  "0.1.0",
+    "private":  true,
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "vite --host 0.0.0.0 --port 5173",
+                    "build":  "tsc --noEmit \u0026\u0026 vite build",
+                    "preview":  "vite preview --host 0.0.0.0 --port 4173"
+                },
+    "dependencies":  {
+                         "react":  "^18.2.0",
+                         "react-dom":  "^18.2.0",
+                         "react-router-dom":  "^6.26.2"
+                     },
+    "devDependencies":  {
+                            "@types/node":  "^22.7.4",
+                            "@types/react":  "^18.3.5",
+                            "@types/react-dom":  "^18.3.0",
+                            "@vitejs/plugin-react":  "^4.3.1",
+                            "typescript":  "^5.5.4",
+                            "vite":  "^5.4.2"
+                        }
+}

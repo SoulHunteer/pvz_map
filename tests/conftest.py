@@ -18,6 +18,8 @@ os.environ["SCREENSHOTS_DIR"] = str((TEST_ROOT / "artifacts" / "screenshots").re
 os.environ["PROCESSED_DIR"] = str((TEST_ROOT / "artifacts" / "processed").resolve())
 os.environ["DIFFS_DIR"] = str((TEST_ROOT / "artifacts" / "diffs").resolve())
 os.environ["LOGS_DIR"] = str((TEST_ROOT / "artifacts" / "logs").resolve())
+os.environ["ALLOWED_TELEGRAM_USER_IDS"] = ""
+os.environ["ADMIN_TELEGRAM_USER_IDS"] = ""
 
 from app.core.settings import get_settings
 from app.db import init_schema, reconfigure_engine

@@ -112,51 +112,6 @@ class ZoneDetector:
         bbox_h: int,
         area: float,
     ) -> bool:
-        if image_width < 1000 or image_height < 500:
-            return False
-
-        # Touches image edges — likely part of the browser chrome or map UI.
-        if bbox_x <= 1 or bbox_y <= 1:
-            return True
-        if bbox_x + bbox_w >= image_width - 1 or bbox_y + bbox_h >= image_height - 1:
-            return True
-
-        # Top-left corner (zoom controls, map logo).
-        if bbox_x < 90 and bbox_y < 90:
-            return True
-        # Right edge strip (legend, controls) — only thin elements that look
-        # like UI widgets, not map zones that happen to be near the edge.
-        right_margin = image_width - (bbox_x + bbox_w)
-        if right_margin < 5:
-            return True
-        if right_margin < 70 and bbox_w < 80 and bbox_h < 80:
-            return True
-
-        # Top-right strip (navigation widgets).
-        if bbox_y < 80 and bbox_x > image_width * 0.55 and bbox_h < 90:
-            return True
-
-        # Bottom strip — cookie banner buttons, attribution bar.
-        if bbox_y + bbox_h > image_height - 85 and bbox_w > 120:
-            return True
-        # Narrower bottom elements (small buttons like "Разрешить" / "Отказаться").
-        if bbox_y > image_height * 0.75 and bbox_h < 60 and bbox_w < 200 and area < 4000:
-            aspect = bbox_w / max(bbox_h, 1)
-            if 1.8 <= aspect <= 6.0:
-                return True
-
-        # Very elongated thin bars near image edges (toolbars, status bars).
-        # Do NOT apply in the interior — thin rectangles are valid building zones.
-        aspect_ratio = max(bbox_w / max(bbox_h, 1), bbox_h / max(bbox_w, 1))
-        near_edge = (
-            bbox_x < 30
-            or bbox_y < 30
-            or bbox_x + bbox_w > image_width - 30
-            or bbox_y + bbox_h > image_height - 30
-        )
-        if aspect_ratio > 4.0 and area < 800 and near_edge:
-            return True
-
         # Giant contour spanning most of the image — map background artifact.
         if area > 0.25 * image_width * image_height:
             return True
@@ -175,6 +130,11 @@ class ZoneDetector:
         max_side = max(bbox_w, bbox_h)
         aspect_ratio = max(bbox_w / max(bbox_h, 1), bbox_h / max(bbox_w, 1))
         fill_ratio = area / (bbox_w * bbox_h + 1e-9)
+
+        # High fill_ratio (> 0.83) indicates a tight-fitting rectangle — these
+        # are real map zones, not round marker icons.  Exempt them early.
+        if fill_ratio > 0.83:
+            return False
 
         # Primary path: classic round markers (map pins, dots).
         if (
@@ -209,7 +169,7 @@ class ZoneDetector:
         cv2.fillPoly(contour_mask, [contour], 255)
 
         contour_pixels = cv2.countNonZero(contour_mask)
-        if contour_pixels < 60:
+        if contour_pixels < 20:
             return False
 
         palette_inside = cv2.countNonZero(cv2.bitwise_and(contour_mask, palette_mask))
@@ -221,6 +181,12 @@ class ZoneDetector:
         # blobs merged by morphology, not real zones.
         if contour_pixels > 40000 and coverage_ratio < 0.55:
             return False
+
+        # Small zones (< 150 pixels) that have high palette coverage are
+        # accepted directly — they are too small for reliable gradient analysis
+        # but the mask + coverage already confirm they are real zones.
+        if contour_pixels < 150 and coverage_ratio >= 0.40:
+            return True
 
         dist = cv2.distanceTransform(contour_mask, cv2.DIST_L2, 5)
         max_dist = float(dist.max())
@@ -235,7 +201,7 @@ class ZoneDetector:
 
         border_count = int(border_mask.sum())
         center_count = int(center_mask.sum())
-        if border_count < 15 or center_count < 15:
+        if border_count < 5 or center_count < 5:
             return False
 
         border_pixels = image[border_mask]
@@ -331,7 +297,7 @@ class ZoneDetector:
                 centroid_y = float(moments["m01"] / moments["m00"])
                 bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(contour)
 
-                if bbox_w < 10 or bbox_h < 10:
+                if bbox_w < 5 or bbox_h < 5:
                     continue
 
                 if self._is_probable_ui_contour(
@@ -347,15 +313,6 @@ class ZoneDetector:
 
                 epsilon = 0.015 * perimeter
                 polygon = cv2.approxPolyDP(contour, epsilon, True)
-
-                if self._is_probable_marker_contour(
-                    area=area,
-                    compactness=compactness,
-                    bbox_w=bbox_w,
-                    bbox_h=bbox_h,
-                    polygon_vertices=len(polygon),
-                ):
-                    continue
 
                 if not self._has_zone_gradient(image, contour, mask):
                     continue
@@ -381,12 +338,80 @@ class ZoneDetector:
         except Exception as exc:
             raise ImageDetectionError("Failed to detect zones") from exc
 
+    def _draw_label_marker(
+        self,
+        image: np.ndarray,
+        point: tuple[int, int],
+        label: str,
+        color: tuple[int, int, int],
+    ) -> None:
+        x, y = int(point[0]), int(point[1])
+        cv2.circle(image, (x, y), 10, color, -1)
+        cv2.circle(image, (x, y), 10, (255, 255, 255), 1)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text_size, _ = cv2.getTextSize(label, font, 0.45, 1)
+        text_w, text_h = text_size
+        text_x = x - text_w // 2
+        text_y = y + text_h // 2
+        cv2.putText(image, label, (text_x, text_y), font, 0.45, (20, 20, 20), 1, cv2.LINE_AA)
+
+    def _draw_compact_legend(self, image: np.ndarray, rows: list[tuple[str, tuple[int, int, int]]]) -> None:
+        if not rows:
+            return
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        line_height = 20
+        padding = 8
+        color_box = 10
+
+        max_text_width = 0
+        for text, _ in rows:
+            (text_width, _), _ = cv2.getTextSize(text, font, font_scale, thickness)
+            max_text_width = max(max_text_width, text_width)
+
+        box_width = padding * 3 + color_box + max_text_width
+        box_height = padding * 2 + line_height * len(rows)
+
+        x0, y0 = 10, 10
+        x1, y1 = x0 + box_width, y0 + box_height
+
+        overlay = image.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (28, 28, 28), -1)
+        cv2.addWeighted(overlay, 0.55, image, 0.45, 0.0, image)
+        cv2.rectangle(image, (x0, y0), (x1, y1), (255, 255, 255), 1)
+
+        for idx, (text, color) in enumerate(rows):
+            row_y = y0 + padding + idx * line_height
+            cv2.rectangle(
+                image,
+                (x0 + padding, row_y + 4),
+                (x0 + padding + color_box, row_y + 4 + color_box),
+                color,
+                -1,
+            )
+            cv2.putText(
+                image,
+                text,
+                (x0 + padding * 2 + color_box, row_y + 14),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
+
     def render_processed_image(self, image: np.ndarray, zones: list[ZoneGeometry], tracked_item_id: int) -> str:
         output = image.copy()
+        zone_color = (46, 204, 113)
+
         for zone in zones:
             polygon = np.array(zone.polygon, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(output, [polygon], isClosed=True, color=(0, 255, 0), thickness=2)
-            cv2.circle(output, (int(zone.centroid_x), int(zone.centroid_y)), 2, (255, 255, 255), -1)
+            cv2.polylines(output, [polygon], isClosed=True, color=zone_color, thickness=2)
+
+        self._draw_compact_legend(output, [(f"Zones: {len(zones)}", zone_color)])
 
         filename = (
             f"processed_{tracked_item_id}_"
@@ -407,22 +432,39 @@ class ZoneDetector:
     ) -> str:
         output = base_image.copy()
 
-        for index, zone in enumerate(current_zones):
-            color = (0, 255, 0)
-            if index in added_indexes:
-                color = (0, 0, 255)
+        added_color = (52, 199, 89)
+        removed_color = (68, 68, 235)
+        stable_color = (255, 206, 84)
+
+        added_set = set(added_indexes)
+        stable_indexes = [idx for idx in range(len(current_zones)) if idx not in added_set]
+
+        for idx in stable_indexes:
+            zone = current_zones[idx]
             polygon = np.array(zone.polygon, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(output, [polygon], isClosed=True, color=color, thickness=2)
+            cv2.polylines(output, [polygon], isClosed=True, color=stable_color, thickness=2)
+
+        for idx in sorted(added_set):
+            zone = current_zones[idx]
+            polygon = np.array(zone.polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(output, [polygon], isClosed=True, color=added_color, thickness=3)
 
         for zone in removed_zones:
             polygon = np.array(zone.polygon, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(output, [polygon], isClosed=True, color=(0, 0, 0), thickness=2)
+            cv2.polylines(output, [polygon], isClosed=True, color=removed_color, thickness=2)
             x1 = zone.bbox_x
             y1 = zone.bbox_y
             x2 = zone.bbox_x + zone.bbox_w
             y2 = zone.bbox_y + zone.bbox_h
-            cv2.line(output, (x1, y1), (x2, y2), (0, 0, 0), 2)
-            cv2.line(output, (x2, y1), (x1, y2), (0, 0, 0), 2)
+            cv2.line(output, (x1, y1), (x2, y2), removed_color, 2)
+            cv2.line(output, (x2, y1), (x1, y2), removed_color, 2)
+
+        legend_rows = [
+            (f"A: {len(added_indexes)} added", added_color),
+            (f"R: {len(removed_zones)} removed", removed_color),
+            (f"S: {len(stable_indexes)} stable", stable_color),
+        ]
+        self._draw_compact_legend(output, legend_rows)
 
         filename = (
             f"diff_{tracked_item_id}_"
@@ -436,3 +478,7 @@ class ZoneDetector:
     @staticmethod
     def zones_to_json(zone: ZoneGeometry) -> tuple[str, str]:
         return json.dumps(zone.polygon), json.dumps(zone.contour)
+
+
+
+

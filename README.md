@@ -1,72 +1,56 @@
-﻿# PVZ Purple Zone Monitor - Telegram-First MVP (Phase 2)
+﻿# PVZ Purple Zone Monitor - Telegram + Web MVP
 
-Project now includes:
-- background monitoring core (scheduler + CV + diff + change events)
-- Telegram bot as primary user UX
-- REST API for upcoming web cabinet
+Полный MVP включает:
+- backend API + scheduler + CV-ядро (contour/polygon detection)
+- Telegram-бот для уведомлений и ручных действий
+- web cabinet для управления отслеживаниями
 
-## Architecture
+## Архитектура
 
 ```text
 app/
-  main.py                 # worker entrypoint (scheduler + bot)
-  api/main.py             # FastAPI app entrypoint
+  main.py                 # worker: scheduler + bot
+  api/main.py             # FastAPI entrypoint
+  api/router.py           # REST endpoints
   core/                   # settings, logging, exceptions
-  db/                     # SQLAlchemy models, repositories, schema init/migration
-  services/               # monitoring, CV, matching, subscriptions, mvp service
-  scheduler/              # periodic checks
-  bot/                    # Telegram UX
+  db/                     # SQLAlchemy models, repositories, schema init
+  services/               # monitoring, scraper, image_detection, matching, mvp logic
+  scheduler/              # background checks
+  bot/                    # Telegram bot runner + handlers
+frontend/
+  src/                    # React + TS web cabinet
+  Dockerfile              # frontend image
+  nginx.conf              # reverse proxy to backend API
 tests/
 ```
 
-## Data Model
+## Ключевые возможности MVP
 
-Core entities:
+- Multiple tracked items на одного пользователя
+- Snapshot history + change events
+- Improved matching зон между проверками
+- Telegram уведомления при изменениях
+- Ручные проверки и фоновые проверки
+- Web cabinet:
+  - Dashboard
+  - Мои отслеживания
+  - Создание отслеживания
+  - Детали отслеживания (snapshots/events/images)
+  - Тариф и лимиты
+
+## Data model
+
+Сущности:
 - `users`
 - `tracked_items`
 - `zone_snapshots`
 - `detected_zones`
 - `change_events`
 
-Supports multiple tracked items per user.
+## API
 
-## Tariff Logic (MVP)
-
-Plans and limits:
-- `trial` / `free`: up to `1` tracked item
-- `base`: up to `5` tracked items
-- `pro`: up to `20` tracked items
-
-Enforced on tracked-item creation.
-Tariff expiration blocks new tracked-item creation and manual checks.
-
-## Telegram Bot UX
-
-Main entry:
-- `/start`
-
-Menu actions:
-- `Add Tracking`
-- `My Trackings`
-- `Event History`
-- `Check History`
-- `Tariff`
-- `Help`
-
-Implemented flows:
-- add new tracking (link -> optional title -> first check -> activation)
-- list tracked items with actions:
-  - check now
-  - enable/disable
-  - delete
-  - details
-- view latest events and latest checks
-- view tariff status
-- receive change notifications from scheduler (text + diff image when available)
-
-## API (for Web Cabinet)
-
-Base endpoints:
+Доступные endpoints:
+- `GET /health`
 - `GET /api/me`
 - `GET /api/tracked-items`
 - `POST /api/tracked-items`
@@ -75,101 +59,111 @@ Base endpoints:
 - `PATCH /api/tracked-items/{id}`
 - `DELETE /api/tracked-items/{id}`
 - `GET /api/tracked-items/{id}/snapshots`
+- `GET /api/tracked-items/{id}/snapshots/{snapshot_id}/zone-diff`
 - `GET /api/tracked-items/{id}/events`
 
-Extra:
-- `GET /health`
+Отдача файлов артефактов:
+- `GET /artifacts/screenshots/<file>`
+- `GET /artifacts/processed/<file>`
+- `GET /artifacts/diffs/<file>`
 
-### Dev Auth
+## Dev auth (MVP)
 
-Current phase uses dev-auth headers:
-- `X-Dev-Telegram-Id` (required)
-- `X-Dev-Username` (optional)
-- `X-Dev-Full-Name` (optional)
+Для API и web cabinet используется dev-auth заголовками:
+- `X-Dev-Telegram-Id` (обязательный)
+- `X-Dev-Username` (опционально)
+- `X-Dev-Full-Name` (опционально)
 
-Example:
+Web cabinet хранит эти значения локально и подставляет в каждый запрос.
 
-```bash
-curl -H "X-Dev-Telegram-Id: 12345" http://localhost:8000/api/me
-```
+## Тарифы и лимиты
 
-## Configuration
+- `trial/free`: до `1` tracked item
+- `base`: до `5`
+- `pro`: до `20`
 
-1. Create `.env` from template:
+Лимиты проверяются в business-логике на создании новых отслеживаний.
+При истечении тарифа блокируются создание и ручные проверки.
+
+## Конфигурация
+
+1. Создать `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Key variables:
+2. Важные переменные backend:
 - `TELEGRAM_BOT_TOKEN`
-- `ENABLE_BOT`
-- `ENABLE_SCHEDULER`
+- `ENABLE_BOT`, `ENABLE_SCHEDULER`
 - `DATABASE_URL`
+- `API_CORS_ORIGINS`
+- `ALLOWED_TELEGRAM_USER_IDS`, `ADMIN_TELEGRAM_USER_IDS`
 - `MAX_ITEMS_TRIAL_FREE`, `MAX_ITEMS_BASE`, `MAX_ITEMS_PRO`
-- browser settings (`CHROME_BINARY_PATH`, `CHROMEDRIVER_PATH`)
 
-## Run Locally
+3. Важные переменные frontend (`frontend/.env`):
+- `VITE_API_BASE_URL` (например `http://localhost:8000`)
+- `VITE_ASSET_BASE_URL` (обычно тот же backend)
 
-Install:
+## Локальный запуск
+
+### Backend зависимости
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Run worker (scheduler + bot):
-
-```bash
-python -m app.main
-```
-
-Run single scheduler iteration:
-
-```bash
-RUN_ONCE=true python -m app.main
-```
-
-Run API:
+### Запуск API
 
 ```bash
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 ```
 
-## Docker
+### Запуск bot (scheduler + bot)
+
+```bash
+python -m app.main
+```
+
+### Запуск web cabinet
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend по умолчанию: `http://localhost:5173`.
+
+## Docker запуск (полный MVP)
 
 ```bash
 docker compose up --build
 ```
 
-Services:
-- `worker` (scheduler + bot)
+Сервисы:
+- `bot` (scheduler + bot)
 - `api` (FastAPI)
+- `frontend` (Nginx + React build) на `http://localhost:3000`
 
-## Logging
-
-Logs include:
-- user actions in bot
-- tracked-item create/update/delete
-- manual checks
-- notification attempts
-- scheduler and scraping errors
-
-## Tests
-
-Run:
+## Тесты
 
 ```bash
 pytest
 ```
 
-Covered baseline:
-- contour-based detection
+Покрытие базового ядра:
+- detection
 - zone matching
-- snapshot + change event generation
-- tariff limits
+- monitoring pipeline
+- subscription limits
 - API tracked-item flow
 
-## Notes
+## Ограничения MVP
 
-- Legacy prototype file `pvz_map.py` is kept for reference.
-- Payment is still mocked (tariff switching is test-mode), but architecture is prepared for real payment integration.
+- Нет production auth и оплаты (dev-auth + mock тарификация)
+- Frontend рассчитан на MVP-функции без расширенной аналитики
+- CV детектирование зависит от визуального стиля карты WB и требует периодической калибровки порогов
+
+
+

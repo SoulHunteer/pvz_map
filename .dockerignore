@@ -11,3 +11,5 @@ data/
 bot.log
 users.db
 chromedriver.exe
+frontend/node_modules/
+frontend/dist/

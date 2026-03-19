@@ -145,6 +145,26 @@ async def list_item_snapshots(
         raise
 
 
+@router.get("/api/tracked-items/{tracked_item_id}/snapshots/{snapshot_id}/zone-diff")
+async def get_snapshot_zone_diff(
+    tracked_item_id: int,
+    snapshot_id: int,
+    previous_snapshot_id: int | None = None,
+    auth: AuthContext = Depends(get_auth_context),
+    mvp_service: MvpService = Depends(get_mvp_service),
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            mvp_service.get_snapshot_zone_diff,
+            auth.telegram_user_id,
+            tracked_item_id,
+            snapshot_id,
+            previous_snapshot_id,
+        )
+    except Exception as exc:
+        _raise_http_for_domain_error(exc)
+        raise
+
 @router.get("/api/tracked-items/{tracked_item_id}/events")
 async def list_item_events(
     tracked_item_id: int,
@@ -158,4 +178,5 @@ async def list_item_events(
     except Exception as exc:
         _raise_http_for_domain_error(exc)
         raise
+
 

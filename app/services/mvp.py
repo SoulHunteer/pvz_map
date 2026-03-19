@@ -1,18 +1,20 @@
 ﻿from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import urlparse
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.exceptions import AccessDeniedError, NotFoundError, TariffLimitError, ValidationError
 from app.core.settings import Settings
-from app.db.models import ChangeEvent, TrackedItem, User, ZoneSnapshot
+from app.db.models import ChangeEvent, DetectedZone, SnapshotStatus, TrackedItem, User, ZoneSnapshot
 from app.db.repositories import ChangeEventRepository, SnapshotRepository, TrackedItemRepository, UserRepository
 from app.db.session import SessionLocal
 from app.services.monitoring import MonitoringService
+from app.services.types import ZoneGeometry
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +179,79 @@ class MvpService:
             "zone_count": snapshot.zone_count,
             "error_message": snapshot.error_message,
         }
+
+    @staticmethod
+    def _db_zone_to_geometry(db_zone: DetectedZone) -> ZoneGeometry:
+        polygon = json.loads(db_zone.polygon_json) if db_zone.polygon_json else []
+        contour = json.loads(db_zone.contour_json) if db_zone.contour_json else []
+        return ZoneGeometry(
+            centroid_x=db_zone.centroid_x,
+            centroid_y=db_zone.centroid_y,
+            bbox_x=db_zone.bbox_x,
+            bbox_y=db_zone.bbox_y,
+            bbox_w=db_zone.bbox_w,
+            bbox_h=db_zone.bbox_h,
+            area=db_zone.area,
+            perimeter=db_zone.perimeter,
+            polygon=polygon,
+            contour=contour,
+            shape_hash=db_zone.shape_hash,
+        )
+
+    @staticmethod
+    def _zone_to_overlay_dict(
+        zone: ZoneGeometry,
+        status: str,
+        label: str,
+        appeared_at: datetime | None = None,
+        updated_at: datetime | None = None,
+        last_seen_at: datetime | None = None,
+    ) -> dict:
+        return {
+            "status": status,
+            "label": label,
+            "centroid_x": zone.centroid_x,
+            "centroid_y": zone.centroid_y,
+            "bbox_x": zone.bbox_x,
+            "bbox_y": zone.bbox_y,
+            "bbox_w": zone.bbox_w,
+            "bbox_h": zone.bbox_h,
+            "area": zone.area,
+            "perimeter": zone.perimeter,
+            "polygon": zone.polygon,
+            "contour": zone.contour,
+            "shape_hash": zone.shape_hash,
+            "appeared_at": _iso(appeared_at),
+            "updated_at": _iso(updated_at),
+            "last_seen_at": _iso(last_seen_at),
+        }
+
+    @staticmethod
+    def _shape_hash_lifecycle(session, tracked_item_id: int, shape_hashes: set[str]) -> dict[str, tuple[datetime, datetime]]:
+        if not shape_hashes:
+            return {}
+
+        stmt = (
+            select(
+                DetectedZone.shape_hash,
+                func.min(ZoneSnapshot.checked_at),
+                func.max(ZoneSnapshot.checked_at),
+            )
+            .join(ZoneSnapshot, DetectedZone.snapshot_id == ZoneSnapshot.id)
+            .where(
+                ZoneSnapshot.tracked_item_id == tracked_item_id,
+                ZoneSnapshot.status == SnapshotStatus.SUCCESS,
+                DetectedZone.shape_hash.in_(sorted(shape_hashes)),
+            )
+            .group_by(DetectedZone.shape_hash)
+        )
+
+        rows = session.execute(stmt).all()
+        lifecycle: dict[str, tuple[datetime, datetime]] = {}
+        for shape_hash, first_seen, last_seen in rows:
+            if shape_hash and first_seen is not None and last_seen is not None:
+                lifecycle[str(shape_hash)] = (_as_utc(first_seen), _as_utc(last_seen))
+        return lifecycle
 
     def get_or_create_user_summary(
         self,
@@ -356,6 +431,116 @@ class MvpService:
             events = event_repo.list_for_tracked_item(item.id, limit=limit)
             session.commit()
             return [self._event_to_dict(event, item.title) for event in events]
+
+    def get_snapshot_zone_diff(
+        self,
+        telegram_user_id: int,
+        tracked_item_id: int,
+        snapshot_id: int,
+        previous_snapshot_id: int | None = None,
+    ) -> dict:
+        with SessionLocal() as session:
+            _, item = self._get_item_for_user(session, telegram_user_id, tracked_item_id)
+            snapshot_repo = SnapshotRepository(session)
+
+            current_snapshot = snapshot_repo.get(snapshot_id)
+            if current_snapshot is None or current_snapshot.tracked_item_id != item.id:
+                raise NotFoundError("Snapshot not found")
+
+            current_db_zones = snapshot_repo.get_detected_zones(current_snapshot.id)
+            current_zones = [self._db_zone_to_geometry(zone) for zone in current_db_zones]
+
+            previous_snapshot: ZoneSnapshot | None = None
+            if previous_snapshot_id is not None:
+                previous_snapshot = snapshot_repo.get(previous_snapshot_id)
+                if previous_snapshot is None or previous_snapshot.tracked_item_id != item.id:
+                    raise NotFoundError("Previous snapshot not found")
+            else:
+                previous_snapshot = snapshot_repo.latest_success_snapshot(
+                    tracked_item_id=item.id,
+                    exclude_snapshot_id=current_snapshot.id,
+                )
+
+            previous_zones: list[ZoneGeometry] = []
+            if previous_snapshot is not None:
+                previous_db_zones = snapshot_repo.get_detected_zones(previous_snapshot.id)
+                previous_zones = [self._db_zone_to_geometry(zone) for zone in previous_db_zones]
+
+            match_result = self.monitoring_service.matcher.match(previous_zones, current_zones)
+            added_set = set(match_result.added_current_indices)
+            removed_set = set(match_result.removed_previous_indices)
+            stable_indexes = [idx for idx in range(len(current_zones)) if idx not in added_set]
+
+            shape_hashes = {
+                zone.shape_hash
+                for zone in [*current_zones, *previous_zones]
+                if zone.shape_hash
+            }
+            lifecycle_by_hash = self._shape_hash_lifecycle(session, item.id, shape_hashes)
+
+            current_checked_at = _as_utc(current_snapshot.checked_at)
+            previous_checked_at = _as_utc(previous_snapshot.checked_at) if previous_snapshot else None
+
+            zones_payload: list[dict] = []
+            added_counter = 1
+            stable_counter = 1
+            for idx, zone in enumerate(current_zones):
+                first_seen, last_seen = lifecycle_by_hash.get(zone.shape_hash or "", (None, None))
+                if idx in added_set:
+                    zones_payload.append(
+                        self._zone_to_overlay_dict(
+                            zone,
+                            status="added",
+                            label=f"A{added_counter}",
+                            appeared_at=first_seen or current_checked_at,
+                            updated_at=current_checked_at,
+                            last_seen_at=current_checked_at,
+                        )
+                    )
+                    added_counter += 1
+                else:
+                    zones_payload.append(
+                        self._zone_to_overlay_dict(
+                            zone,
+                            status="stable",
+                            label=f"S{stable_counter}",
+                            appeared_at=first_seen or previous_checked_at or current_checked_at,
+                            updated_at=current_checked_at,
+                            last_seen_at=last_seen or current_checked_at,
+                        )
+                    )
+                    stable_counter += 1
+
+            removed_counter = 1
+            for idx in sorted(removed_set):
+                zone = previous_zones[idx]
+                first_seen, last_seen = lifecycle_by_hash.get(zone.shape_hash or "", (None, None))
+                zones_payload.append(
+                    self._zone_to_overlay_dict(
+                        zone,
+                        status="removed",
+                        label=f"R{removed_counter}",
+                        appeared_at=first_seen or previous_checked_at,
+                        updated_at=current_checked_at,
+                        last_seen_at=last_seen or previous_checked_at,
+                    )
+                )
+                removed_counter += 1
+
+            session.commit()
+            return {
+                "tracked_item_id": item.id,
+                "snapshot_id": current_snapshot.id,
+                "snapshot_checked_at": _iso(current_snapshot.checked_at),
+                "previous_snapshot_id": previous_snapshot.id if previous_snapshot else None,
+                "counts": {
+                    "added": len(added_set),
+                    "removed": len(removed_set),
+                    "stable": len(stable_indexes),
+                    "total_current": len(current_zones),
+                },
+                "zones": zones_payload,
+            }
 
     def list_recent_events_for_user(self, telegram_user_id: int, limit: int = 10) -> list[dict]:
         self._assert_user_allowed(telegram_user_id)

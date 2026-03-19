@@ -2,7 +2,6 @@
 
 import logging
 import os
-import platform
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,13 +57,13 @@ class MapScraper:
         if self.settings.chrome_headless:
             options.add_argument("--headless=new")
 
-
-        if platform.system().lower().startswith("win"):
-            options.add_argument("--use-angle=swiftshader")
-            options.add_argument("--enable-webgl")
-            options.add_argument("--ignore-gpu-blocklist")
-        else:
-            options.add_argument("--disable-gpu")
+        # WB map relies on WebGL rendering. In Linux containers, forcing
+        # --disable-gpu often produces a flat gray frame in headless mode.
+        # Use software WebGL (SwiftShader) across platforms for consistent
+        # screenshots.
+        options.add_argument("--use-angle=swiftshader")
+        options.add_argument("--enable-webgl")
+        options.add_argument("--ignore-gpu-blocklist")
 
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -537,10 +536,3 @@ class MapScraper:
         finally:
             if driver is not None:
                 driver.quit()
-
-
-
-
-
-
-
